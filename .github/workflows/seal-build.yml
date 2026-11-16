@@ -1,0 +1,137 @@
+name: seal-build
+
+# golang.org/x/net ships no GitHub Actions CI (upstream tests on Go's own
+# builders via Gerrit). This workflow mirrors that: build the module, run the
+# full `go test ./...` suite on the Go release line named by go.mod's `go`
+# directive, and pack the module zip exactly as proxy.golang.org serves it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated top-level test names to run instead of the full suite'
+        required: false
+        default: ''
+
+jobs:
+  build-test:
+    name: Build and test (Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.24']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: false
+
+      - name: Create module zip
+        # Packed from a copy of the clean tree, before any build byproducts
+        # exist, with this fork-only workflow removed (it is not part of the
+        # published module). golang.org/x/mod/zip.CreateFromDir applies the
+        # module proxy's own inclusion rules.
+        run: |
+          set -euo pipefail
+          MODSRC="$RUNNER_TEMP/modsrc"
+          HELPER="$RUNNER_TEMP/zipper"
+          OUT="$RUNNER_TEMP/build_output"
+          mkdir -p "$MODSRC" "$HELPER" "$OUT"
+          echo "BUILD_OUTPUT=$OUT" >> "$GITHUB_ENV"
+          cp -a "$GITHUB_WORKSPACE/." "$MODSRC/"
+          rm -rf "$MODSRC/.git" "$MODSRC/.github/workflows/seal-build.yml"
+          find "$MODSRC/.github" -depth -type d -empty -delete
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+          	"log"
+          	"os"
+
+          	"golang.org/x/mod/module"
+          	"golang.org/x/mod/zip"
+          )
+
+          func main() {
+          	m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+          	f, err := os.Create(os.Args[4])
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer f.Close()
+          	if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+          		log.Fatal(err)
+          	}
+          	log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$HELPER"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . golang.org/x/net v0.45.0 "$MODSRC" "$OUT/v0.45.0.zip"
+          unzip -l "$OUT/v0.45.0.zip" | tail -1
+
+      - name: Download and verify dependencies
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Configure host networking for the ipv4/ipv6/icmp tests
+        # The nettest-based suites skip unless loopback carries a routable
+        # (non-::1) IPv6 address and unprivileged ICMP echo sockets are
+        # allowed. Loopback is left without the MULTICAST flag: with it set,
+        # the ipv4/ipv6 multicast read/write tests block forever on this VM
+        # (no multicast delivery on lo), so they skip with their own reason.
+        run: |
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          ip -6 addr show dev lo | grep -q ' ::1/' || sudo ip -6 addr add ::1/128 dev lo
+          sudo ip -6 addr add fe80::1/64 dev lo
+          sudo ip -6 addr add fd00:5ea1::1/128 dev lo
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          ip addr show dev lo
+
+      - name: Test
+        run: |
+          set -o pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "$FILTER" ]; then
+            go test -v -exec "sudo env PATH=$PATH HOME=$HOME" -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            # Test binaries run as root so the raw-socket ipv4/ipv6 tests
+            # (e.g. GRE listeners) run instead of skipping on EPERM.
+            go test -v -exec "sudo env PATH=$PATH HOME=$HOME" ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            echo "Skipped tests and reasons (the t.Skip message go test -v logged under each test's === RUN):"
+            awk '/^(ok|FAIL)[[:space:]]/{split("", reason); cur=""; next}
+                 /^=== (RUN|CONT)/{cur=$3; next}
+                 /^[[:space:]]+[^ ]+_test\.go:[0-9]+:/{if (cur != "" && !(cur in reason)) {r=$0; sub(/^[[:space:]]+/, "", r); reason[cur]=r}}
+                 /^[[:space:]]*--- SKIP/{print "SKIPPED: " $3 " -- reason: " reason[$3]}' "$RUNNER_TEMP/full.log"
+            echo "Notes on the skip reasons above:"
+            echo "  'not supported on linux/amd64' (ipv4/ipv6 ICMP/raw tests): nettest.SupportsRawSocket probes socket(AF_INET, SOCK_RAW, 0), which the Linux kernel rejects (EPROTONOSUPPORT) even for root, so these tests skip on every Linux host."
+            echo "  'no available interface' / 'not available on linux' (multicast tests): they need a loopback with the MULTICAST flag; enabling it on the GitHub runner VM makes the multicast read/write tests block until the 10m go test timeout."
+            echo "  'avoid external network' (icmp TestDiag): opt-in via -diag, pings hosts on the public internet."
+            echo "  'too slow in -race mode' (hpack TestSlowIncrementalDecode): unconditional t.Skip in upstream source."
+            echo "  'linux: sending from invalid source succeeds' (quic TestUDPSourceInvalid): upstream skips it on Linux by design."
+            PASS=$(awk '/^[[:space:]]*--- PASS/{c++} END{print c+0}' "$RUNNER_TEMP/full.log")
+            FAIL=$(awk '/^[[:space:]]*--- FAIL/{c++} END{print c+0}' "$RUNNER_TEMP/full.log")
+            SKIP=$(awk '/^[[:space:]]*--- SKIP/{c++} END{print c+0}' "$RUNNER_TEMP/full.log")
+            echo "TEST SUMMARY: $PASS passed, $FAIL failed, $SKIP skipped"
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: ${{ env.BUILD_OUTPUT }}/v0.45.0.zip
+          if-no-files-found: error
